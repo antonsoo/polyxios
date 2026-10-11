@@ -474,6 +474,7 @@ CAPABILITIES: dict[str, Cap] = {
         geometry=False,
         coords=False,
         element_attrs=("normals",),
+        warns=(r"element\(s\) that are not triangles \(quad\)",),
         note="STL is triangles only, stored per facet: the quad is dropped and"
         " the surviving triangle's vertices are not shared.",
     ),

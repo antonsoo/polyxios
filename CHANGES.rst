@@ -360,6 +360,10 @@ Behaviour changes
   installing a package that will not run. The floor is what the language
   level is now written against: the type-parameter syntax 3.12 introduced is
   in use where a generic helper needed a type variable declared beside it.
+- STL write warns when it skips elements that are not triangles, with their
+  count and types. A quad, a line or a tetrahedron has no STL spelling and
+  was dropped without a word, so a mesh could lose most of itself on the
+  way out. A suite that runs with warnings as errors sees the skip now.
 
 Bug fixes
 ~~~~~~~~~
@@ -464,6 +468,10 @@ Bug fixes
   missing and the caller was sent looking for a path already there. The
   question is asked with ``stat`` now, which refuses on every version and
   says by errno which case it is.
+- STL write refuses, with ``CodecError`` naming the element, a triangle
+  that references a vertex outside the mesh. A negative index wrapped to
+  the last vertex and wrote wrong geometry; one past the end raised a bare
+  ``IndexError``.
 
 Tests
 ~~~~~
@@ -472,9 +480,15 @@ Tests
   release. It was the one supported version nothing exercised, and the
   ``Path.exists`` change above reached a packaged build before any test saw
   it.
+- Python 3.15 is in the test matrix. Its rows install ``netcdf`` and
+  ``pytest`` only, as h5py, lazrs and PyYAML publish no cp315 wheels yet,
+  so the HDF5 and LAZ tests skip there.
 
 Packaging
 ~~~~~~~~~
+
+- Python 3.15 wheels are built for a release, for Linux, macOS and
+  Windows, and the distribution declares 3.15 among its classifiers.
 
 - The PyPI page now carries the project links (homepage, documentation,
   changelog, issue tracker, source), trove classifiers, keywords and an

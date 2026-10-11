@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import warnings
 
 import numpy as np
 import pytest
 
 import polyxios
 from polyxios import make_polydata
+from polyxios._element_types import ELEMENT_TYPES
 from polyxios._types import PolyData
 from polyxios.codecs._stl import _BINARY_FACET_SIZE, _HEADER_SIZE, read, write
 from polyxios.exceptions import CodecError, LazyReadError
@@ -128,6 +130,66 @@ def test_write_no_triangles_raises(tmp_path: Path) -> None:
     tmp = tmp_path / "test.stl"
     with pytest.raises(CodecError):
         write(poly, tmp)
+
+
+@pytest.mark.parametrize("binary", [True, False])
+def test_write_warns_on_skipped_non_triangles(tmp_path: Path, binary: bool) -> None:
+    verts = np.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 0, 1]], dtype=np.float64
+    )
+    poly = make_polydata(
+        verts,
+        [
+            ("triangle", np.array([[0, 1, 2]])),
+            ("quad", np.array([[0, 1, 3, 2]])),
+            ("line", np.array([[0, 4], [1, 4]])),
+        ],
+    )
+    tmp = tmp_path / "test.stl"
+    with pytest.warns(UserWarning, match=r"3 element\(s\).*\(line, quad\)"):
+        write(poly, tmp, binary=binary)
+    assert len(read(tmp).element_types) == 1
+
+
+def test_write_triangles_only_does_not_warn(tmp_path: Path) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        write(_tetrahedron(), tmp_path / "test.stl")
+
+
+def test_write_malformed_triangle_raises_before_warning(tmp_path: Path) -> None:
+    """A mesh that cannot be written is refused without a skip warning first."""
+    poly = PolyData(
+        vertices=np.zeros((4, 3), dtype=np.float64),
+        connectivity=np.array([0, 1, 2, 3, 0, 1, 2, 3], dtype=np.int32),
+        offsets=np.array([0, 4, 8], dtype=np.int32),
+        element_types=np.array(
+            [ELEMENT_TYPES["triangle"], ELEMENT_TYPES["quad"]], dtype=np.uint8
+        ),
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(CodecError, match="connectivity != 3"):
+            write(poly, tmp_path / "test.stl")
+    assert caught == []
+
+
+@pytest.mark.parametrize("binary", [True, False])
+@pytest.mark.parametrize("bad", [9, -1])
+def test_write_out_of_range_vertex_raises(
+    tmp_path: Path, binary: bool, bad: int
+) -> None:
+    """A negative index would wrap to the last vertex and write wrong geometry."""
+    poly = PolyData(
+        vertices=np.eye(3, dtype=np.float64),
+        connectivity=np.array([0, 1, bad], dtype=np.int32),
+        offsets=np.array([0, 3], dtype=np.int32),
+        element_types=np.array([ELEMENT_TYPES["triangle"]], dtype=np.uint8),
+    )
+    tmp = tmp_path / "test.stl"
+    with pytest.raises(CodecError, match=rf"element 0 references vertex {bad},"):
+        write(poly, tmp, binary=binary)
+    assert not tmp.exists()
 
 
 def test_degenerate_triangle_normals(tmp_path: Path) -> None:
