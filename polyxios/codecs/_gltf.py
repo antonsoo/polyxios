@@ -35,7 +35,15 @@ from polyxios._scene import (
     SceneNode,
     SceneTexture,
 )
-from polyxios._trs import matrix_of_trs, trs_of_matrix
+from polyxios._trs import (
+    _EXACT_TOLERANCE,
+    matrices_of_element,
+    matrices_of_trs,
+    matrix_of_element,
+    matrix_of_trs,
+    trs_of_matrices,
+    trs_of_matrix,
+)
 from polyxios._types import PolyData
 from polyxios._warn import warn_caller as _warn_caller
 from polyxios.exceptions import CodecError, LazyReadError
@@ -2083,14 +2091,28 @@ def write_scene(
     accessor type as wide as a row: a scalar, 2, 3 or 4 components, or the
     9 or 16 of a matrix. Any other shape is skipped with a warning.
 
-    A ``matrix`` channel of ``LINEAR`` or ``STEP`` keys that animates a
-    node's whole transform - the node spelled with that one matrix alone,
-    or with no spelling at all - is written as translation, rotation and
-    scale channels instead, each key split into the three (a shear or
-    projection is dropped, with a warning); between keys glTF blends those
-    rather than the matrix. It is skipped with a warning when another
-    channel of its animation already animates one of the node's three
-    paths.
+    A COLLADA channel - one naming the ``sid`` of a transform element in
+    its node's ``extras["transforms"]``, or a ``matrix`` channel on a node
+    with no spelling - is rebuilt as translation, rotation and scale
+    channels instead: each node's channels are applied to its elements at
+    the union of their key times, and the composed matrix of each key is
+    split into the three (a shear or projection is dropped, with a
+    warning). COLLADA plays every animation at once, so a node's channels
+    in several animations are rebuilt together, in the first of them,
+    unless two animate the same values: each is then a clip of its own,
+    with a warning when one holds at rest values only another animates.
+    A ``STEP`` channel beside blending ones gets a key just before each
+    of its steps, ``BEZIER`` keys are sampled four times per span along
+    their curve, spans are split until the translation and scale stray
+    from the straight line glTF blends by at most a thousandth of their
+    range, as a curve or a translation swung by a ``<rotate>`` before it
+    does, and spans turning more than 15 degrees are split, since glTF slerps
+    where COLLADA blends the elements; the keys these splits add are
+    capped at 262144 per write, with a warning. A channel that cannot be
+    rebuilt is skipped with a warning, as are all of a node's in an
+    animation when another channel of that animation already animates one
+    of the node's three paths; its channels in other animations are still
+    rebuilt.
     """
     if binary is None:
         binary = format_suffix(path).lower() != ".gltf"
@@ -2153,8 +2175,9 @@ def write_scene(
     # Nodes.
     # Nodes targeted by animation channels MUST use T/R/S, not matrix.
     identity = np.eye(4, dtype=np.float64)
-    animations = _split_matrix_channels(
-        _animation_objects(scene.global_attrs.get("animations")), scene.nodes
+    animations = _rebuild_transform_channels(
+        animations=_animation_objects(scene.global_attrs.get("animations")),
+        nodes=scene.nodes,
     )
     animated_node_indices: set[int] = set()
     n_nodes = len(scene.nodes)
@@ -2862,19 +2885,247 @@ def _foreign_channel(ch: Any, samplers: Any, *, n_nodes: int) -> str | None:
     return _bad_sampler(samplers[sampler_idx], path)
 
 
-_MATRIX_TARGET_KEYS = frozenset({"node", "path", "sid", "member"})
-_MATRIX_INTERPOLATIONS = frozenset({"LINEAR", "STEP"})
+_TRANSFORM_TARGET_KEYS = frozenset({"node", "path", "sid", "member"})
 _TRS_PATHS = ("translation", "rotation", "scale")
+_ELEMENT_OF_PATH = {
+    "matrix": "matrix",
+    "translation": "translate",
+    "rotation": "rotate",
+    "scale": "scale",
+    "lookat": "lookat",
+}
+_ELEMENT_SIZE = {"matrix": 16, "translate": 3, "rotate": 4, "scale": 3, "lookat": 9}
+_NAMED_MEMBERS = {
+    "translate": ("X", "Y", "Z"),
+    "scale": ("X", "Y", "Z"),
+    "rotate": ("X", "Y", "Z", "ANGLE"),
+}
+_MEMBER_INDICES = re.compile(r"(?:\(\d+\))+\Z")
+_REBUILT_INTERPOLATIONS = ("LINEAR", "STEP", "BEZIER")
+# glTF slerps a rotation between keys where COLLADA blends the elements;
+# keys this close in angle keep the two within a fraction of a degree.
+_REBUILD_MAX_DEGREES: float = 15.0
+_REBUILD_CURVE_PIECES: int = 4
+_REBUILD_MAX_PASSES: int = 8
+# Keys added by splitting spans, per write rather than per node, so that a
+# few bytes of turn on many nodes cannot multiply it.
+_REBUILD_MAX_KEYS: int = 1 << 18
+# Of the node's range of translation, or of scale, over its keys.
+_REBUILD_CURVE_TOLERANCE: float = 1e-3
+_BEZIER_STEPS: int = 48
 
 
-def _whole_matrix_channel(
-    ch: Any, samplers: Any, nodes: tuple[SceneNode, ...]
-) -> tuple[int, np.ndarray, np.ndarray, str] | None:
-    """Return the keys of a channel animating a node's whole matrix.
+@dataclasses.dataclass(frozen=True)
+class _Track:
+    """One COLLADA channel bound to the transform element it animates.
 
-    A COLLADA ``matrix`` channel animates one ``<matrix>`` element; it is
-    the node's whole local transform only when the node is spelled with
-    that element alone, or carries no spelling at all.
+    ``columns`` are the element's values the channel sets, ``values`` one
+    row of them per key; ``tangents`` are the BEZIER ``(in, out)`` control
+    points, each ``(n, width, 2)`` as time and value, None otherwise;
+    ``trs`` is the translation, rotation and scale of each key of a
+    ``LINEAR`` channel on a whole ``<matrix>``, None otherwise. Such a
+    channel blends its keys as decomposed translation, rotation and scale,
+    as importers do, whether or not the node spells other elements too.
+    """
+
+    node: int
+    element: int
+    columns: tuple[int, ...]
+    times: np.ndarray
+    values: np.ndarray
+    interpolation: str
+    tangents: tuple[np.ndarray, np.ndarray] | None
+    trs: tuple[np.ndarray, np.ndarray, np.ndarray] | None
+
+
+def _node_elements(
+    *, node: SceneNode
+) -> list[tuple[str, Any, np.ndarray]] | None | str:
+    """Return the transform elements a node was read with, to animate.
+
+    Parameters
+    ----------
+    node
+        The scene node.
+
+    Returns
+    -------
+    list, None or str
+        ``(kind, sid, values)`` per element of ``extras["transforms"]``;
+        None when the node carries no spelling; or the reason the spelling
+        cannot be animated: not a list of COLLADA transform elements,
+        composing past float64, or no longer composing to ``node.matrix``,
+        to about six significant digits of its 3x3 basis, its translation
+        and its last row each, as when it was edited after reading.
+    """
+    spelled = node.extras.get("transforms")
+    if spelled is None:
+        return None
+    elements: list[tuple[str, Any, np.ndarray]] = []
+    try:
+        if not isinstance(spelled, list) or not spelled:
+            raise ValueError
+        matrix = np.eye(4)
+        for t in spelled:
+            kind = t["kind"]
+            values = np.asarray(t["values"], dtype=np.float64).ravel()
+            if kind not in _ELEMENT_SIZE or values.size != _ELEMENT_SIZE[kind]:
+                raise ValueError
+            if not np.isfinite(values).all():
+                raise ValueError
+            with np.errstate(over="ignore", invalid="ignore"):
+                matrix = matrix @ matrix_of_element(kind=kind, values=values)
+            elements.append((kind, t.get("sid"), values))
+    except (KeyError, TypeError, ValueError):
+        return f"its node's transforms {spelled!r} are not COLLADA transform elements"
+    if not np.isfinite(matrix).all():
+        return "its node's transform elements compose to a matrix too large for float64"
+    target = np.asarray(node.matrix, dtype=np.float64)
+    # A large translation must not widen the tolerance on the basis.
+    parts = (np.s_[:3, :3], np.s_[:3, 3], np.s_[3, :])
+    if not all(
+        np.allclose(
+            matrix[part],
+            target[part],
+            rtol=0.0,
+            atol=_EXACT_TOLERANCE
+            * max(np.abs(target[part]).max(), np.abs(matrix[part]).max(), 1.0),
+        )
+        for part in parts
+    ):
+        return (
+            "its node's matrix no longer composes from the transform elements "
+            "it was read with"
+        )
+    return elements
+
+
+def _member_columns(*, kind: str, member: Any) -> tuple[int, ...] | None:
+    """Return the values of a ``kind`` element a channel ``member`` sets.
+
+    Parameters
+    ----------
+    kind
+        The element's kind.
+    member
+        The channel's member: None or empty for the whole element, a name
+        (``X``, ``ANGLE``), or ``(i)`` / ``(i)(j)`` indices.
+
+    Returns
+    -------
+    tuple of int or None
+        The indices into the element's values, row-major for a matrix;
+        None when the member names no part of it. A matrix's ``(i)(j)`` is
+        its cell in column ``i``, row ``j``, and ``(i)`` its column ``i``:
+        the specification leaves the order open, and FCollada and Assimp
+        both index the column first, ``(3)(0)`` being the x translation.
+    """
+    size = _ELEMENT_SIZE[kind]
+    if member is None or member == "":
+        return tuple(range(size))
+    if not isinstance(member, str):
+        return None
+    names = _NAMED_MEMBERS.get(kind, ())
+    if member.upper() in names:
+        return (names.index(member.upper()),)
+    if not _MEMBER_INDICES.match(member):
+        return None
+    idx = [int(i) for i in re.findall(r"\d+", member)]
+    if kind == "matrix" and len(idx) == 1 and idx[0] < 4:
+        return tuple(range(idx[0], 16, 4))
+    if kind == "matrix" and len(idx) == 2 and max(idx) < 4:
+        return (4 * idx[1] + idx[0],)
+    if kind != "matrix" and len(idx) == 1 and idx[0] < size:
+        return (idx[0],)
+    return None
+
+
+def _bezier_tangents(
+    *, sampler: dict, times: np.ndarray, width: int
+) -> tuple[np.ndarray, np.ndarray] | str:
+    """Return a BEZIER sampler's control points as time and value pairs.
+
+    A BEZIER tangent is a control point, not a slope: the specification's
+    ``C0`` is ``OUT_TANGENT[i]`` and ``C1`` is ``IN_TANGENT[i+1]``, where
+    a Hermite slope would be ``3 (C0 - P0)``. Three layouts per key are
+    read, told apart by their size, which differ for every key width but
+    one, where the first two coincide:
+
+    - two values per component, a time and a value paired per component
+      (``X`` time, ``X`` value, ``Y`` time, ...), an accessor of stride
+      ``2 * width``, as the OpenCOLLADA 3ds Max and Maya exporters write a
+      multi-component tangent and Blender's importer reads one;
+    - one time, then one value per component, an accessor of stride
+      ``width + 1``, the layout the COLLADA 1.4.1 specification gives
+      under ``<sampler>``, every component's control point at that time;
+    - one value per component, the specification's degenerate 1-D form:
+      the control point's value, its time a third of the way into the
+      span from its own key.
+
+    Parameters
+    ----------
+    sampler
+        The sampler, holding ``in_tangents`` and ``out_tangents``.
+    times
+        Its key times.
+    width
+        The values per key of its output.
+
+    Returns
+    -------
+    tuple or str
+        The ``(n, width, 2)`` in and out control points, or the reason the
+        sampler's tangents cannot be read.
+    """
+    n = len(times)
+    out: list[np.ndarray] = []
+    for key in ("in_tangents", "out_tangents"):
+        if sampler.get(key) is None:
+            return f"its BEZIER sampler has no {key}"
+        try:
+            tangents = np.asarray(sampler[key], dtype=np.float64)
+        except (TypeError, ValueError):
+            return f"its sampler {key} are not numbers"
+        if not np.isfinite(tangents).all():
+            return f"its sampler {key} hold NaN or Inf"
+        if tangents.size == 2 * n * width:
+            out.append(tangents.reshape(n, width, 2))
+        elif tangents.size == n * (width + 1):
+            rows = tangents.reshape(n, width + 1)
+            pairs = np.empty((n, width, 2))
+            pairs[..., 0] = rows[:, :1]
+            pairs[..., 1] = rows[:, 1:]
+            out.append(pairs)
+        elif tangents.size == n * width:
+            gap = np.diff(times, prepend=times[0], append=times[-1])
+            shift = (-gap[:-1] if key == "in_tangents" else gap[1:]) / 3.0
+            pairs = np.empty((n, width, 2))
+            pairs[..., 0] = (times + shift)[:, None]
+            pairs[..., 1] = tangents.reshape(n, width)
+            out.append(pairs)
+        else:
+            return (
+                f"its sampler holds {tangents.size} {key} values, not one or two "
+                f"for each of the {width} values of its {n} keys, nor a time "
+                "and one for each"
+            )
+    return out[0], out[1]
+
+
+def _transform_track(
+    *,
+    ch: Any,
+    samplers: Any,
+    nodes: tuple[SceneNode, ...],
+    elements_of: dict[int, list | None | str],
+) -> _Track | str | None:
+    """Return a channel bound to the COLLADA transform element it animates.
+
+    A COLLADA channel targets one transform element of a node by its
+    ``sid`` - a whole ``<matrix>``, one ``<rotate>``'s ``ANGLE``, a
+    ``<translate>``'s ``X`` - in the element's own values: degrees, rows,
+    an axis and an angle. A ``matrix`` channel on a node carrying no
+    spelling animates its whole matrix.
 
     Parameters
     ----------
@@ -2884,65 +3135,670 @@ def _whole_matrix_channel(
         That animation's ``samplers``.
     nodes
         The scene's nodes.
+    elements_of
+        :func:`_node_elements` per node index, filled as nodes are met.
 
     Returns
     -------
-    tuple or None
-        The node index, the key times, the ``(n, 4, 4)`` row-major key
-        matrices and the interpolation; None when the channel is not one
-        whose keys can be split into translation, rotation and scale.
+    _Track, str or None
+        The bound channel; the reason it cannot be rebuilt; or None when it
+        is not a COLLADA transform channel (it names no ``sid`` and its
+        path is not ``matrix``, its target carries other fields, or it
+        names no sampler).
     """
     target = ch.get("target") if isinstance(ch, dict) else None
-    if not isinstance(target, dict) or target.get("path") != "matrix":
+    if not isinstance(target, dict) or set(target) - _TRANSFORM_TARGET_KEYS:
         return None
-    if set(target) - _MATRIX_TARGET_KEYS or target.get("member") not in (None, ""):
+    path = target.get("path")
+    if not isinstance(path, str) or path not in _ELEMENT_OF_PATH:
         return None
-    node = target.get("node")
-    if isinstance(node, bool) or not isinstance(node, (int, np.integer)):
-        return None
-    if not 0 <= node < len(nodes):
-        return None
-    spelled = nodes[node].extras.get("transforms")
-    if spelled is not None and not (
-        isinstance(spelled, list)
-        and len(spelled) == 1
-        and isinstance(spelled[0], dict)
-        and spelled[0].get("kind") == "matrix"
-        and spelled[0].get("sid") == target.get("sid")
-    ):
+    sid = target.get("sid")
+    if sid is None and path != "matrix":
         return None
     s = _sampler_index(ch, samplers)
     if s is None:
         return None
+    node = target.get("node")
+    if (
+        isinstance(node, bool)
+        or not isinstance(node, (int, np.integer))
+        or not 0 <= node < len(nodes)
+    ):
+        return f"its node {node!r} is not one of the scene's {len(nodes)}"
+    node = int(node)
+    if node not in elements_of:
+        elements_of[node] = _node_elements(node=nodes[node])
+    elements = elements_of[node]
+    if isinstance(elements, str):
+        return elements
+    kind = _ELEMENT_OF_PATH[path]
+    if elements is None:
+        if kind != "matrix":
+            return f"its node {node} spells no transform element of sid {sid!r}"
+        element = 0
+    else:
+        if sid is None:
+            whole = len(elements) == 1 and elements[0][0] == "matrix"
+            element = 0 if whole else None
+        else:
+            element = next(
+                (k for k, (_, e_sid, _) in enumerate(elements) if e_sid == sid), None
+            )
+        if element is None:
+            return f"its node {node} spells no transform element of sid {sid!r}"
+        if elements[element][0] != kind:
+            return (
+                f"the element of sid {sid!r} on node {node} is a "
+                f"<{elements[element][0]}>, which path {path!r} does not animate"
+            )
+    columns = _member_columns(kind=kind, member=target.get("member"))
+    if columns is None:
+        return f"its member {target.get('member')!r} names no part of a <{kind}>"
     sampler = samplers[s]
     if not isinstance(sampler, dict):
-        return None
+        return f"its sampler {sampler!r} is not an object"
     interp = sampler.get("interpolation", "LINEAR")
-    if not isinstance(interp, str) or interp not in _MATRIX_INTERPOLATIONS:
-        return None
+    if not isinstance(interp, str) or interp.upper() not in _REBUILT_INTERPOLATIONS:
+        return (
+            f"its sampler interpolates {interp!r}, and only LINEAR, STEP or "
+            "BEZIER keys are rebuilt as translation, rotation and scale"
+        )
+    interp = interp.upper()
     try:
         times = np.asarray(sampler.get("times"), dtype=np.float64).ravel()
         values = np.asarray(sampler.get("values"), dtype=np.float64)
     except (TypeError, ValueError):
-        return None
-    if not len(times) or values.size != 16 * len(times):
-        return None
+        return "its sampler times or values are not numbers"
+    width = len(columns)
+    if not len(times):
+        return "its sampler holds no key"
+    if values.size != width * len(times):
+        return (
+            f"its sampler holds {values.size} values, not {width} for each of "
+            f"its {len(times)} keys, as the {path} it animates takes"
+        )
     if not (np.isfinite(times).all() and np.isfinite(values).all()):
-        return None
-    if max(np.abs(times).max(), np.abs(values).max()) > _FLOAT32_MAX:
-        return None
-    return int(node), times, values.reshape(len(times), 4, 4), interp
+        return "its sampler holds NaN or Inf"
+    if max(np.abs(times).max(), np.abs(values).max(initial=0.0)) > _FLOAT32_MAX:
+        return "its sampler holds a value float32, the width glTF stores, cannot"
+    if not (np.diff(times) > 0).all():
+        return "its sampler times are not strictly increasing"
+    tangents = None
+    if interp == "BEZIER":
+        tangents = _bezier_tangents(sampler=sampler, times=times, width=width)
+        if isinstance(tangents, str):
+            return tangents
+    values = values.reshape(len(times), width)
+    trs = None
+    if kind == "matrix" and width == 16 and interp == "LINEAR":
+        move, quats, size, _ = trs_of_matrices(matrices=values)
+        flip = np.sum(quats[1:] * quats[:-1], axis=1) < 0
+        sign = np.r_[1.0, np.where(np.cumsum(flip) % 2, -1.0, 1.0)]
+        trs = (move, quats * sign[:, None], size)
+    return _Track(
+        node=node,
+        element=element,
+        columns=columns,
+        times=times,
+        values=values,
+        interpolation=interp,
+        tangents=tangents,
+        trs=trs,
+    )
 
 
-def _split_matrix_channels(animations: Any, nodes: tuple[SceneNode, ...]) -> Any:
-    """Return the animations with whole-matrix channels split into TRS ones.
+def _bezier_at(*, track: _Track, t: np.ndarray, span: np.ndarray) -> np.ndarray:
+    """Return a BEZIER track's values at times ``t`` within each ``span``.
 
-    Each channel :func:`_whole_matrix_channel` accepts is replaced, in its
-    place, by a translation, a rotation and a scale channel over the same
-    times, their samplers appended to the animation's. Every other channel
-    and sampler is kept as is, so its index does not move. Successive
+    Each span is a cubic in time and value per component; the time of its
+    inner control points is clamped to the span, so the curve's time rises
+    and bisection finds the parameter where it reaches ``t``.
+    """
+    p_in, p_out = track.tangents
+    t0, t3 = track.times[span], track.times[span + 1]
+    out = np.empty((len(t), track.values.shape[1]))
+    for c in range(track.values.shape[1]):
+        x1 = np.clip(p_out[span, c, 0], t0, t3)
+        x2 = np.clip(p_in[span + 1, c, 0], t0, t3)
+        lo, hi = np.zeros(len(t)), np.ones(len(t))
+        for _ in range(_BEZIER_STEPS):
+            s = (lo + hi) / 2
+            u = 1 - s
+            x = u**3 * t0 + 3 * u * u * s * x1 + 3 * u * s * s * x2 + s**3 * t3
+            below = x < t
+            lo = np.where(below, s, lo)
+            hi = np.where(below, hi, s)
+        s = (lo + hi) / 2
+        u = 1 - s
+        out[:, c] = (
+            u**3 * track.values[span, c]
+            + 3 * u * u * s * p_out[span, c, 1]
+            + 3 * u * s * s * p_in[span + 1, c, 1]
+            + s**3 * track.values[span + 1, c]
+        )
+    return out
+
+
+def _slerp(*, a: np.ndarray, b: np.ndarray, f: np.ndarray) -> np.ndarray:
+    """Return the rotations a fraction of the way from some to others.
+
+    Parameters
+    ----------
+    a, b
+        ``(n, 4)`` unit quaternions ``(x, y, z, w)`` to turn from and to.
+    f
+        ``(n,)`` fractions of the way, from 0 at ``a`` to 1 at ``b``.
+
+    Returns
+    -------
+    np.ndarray
+        ``(n, 4)`` unit quaternions, along the great arc from ``a`` to
+        ``b``; the arc is the short one only when ``a`` and ``b`` lie in
+        the same hemisphere.
+    """
+    dots = np.clip(np.sum(a * b, axis=1), -1.0, 1.0)
+    angle = np.arccos(dots)
+    sin = np.sin(angle)
+    near = sin < 1e-9
+    safe = np.where(near, 1.0, sin)
+    wa = np.where(near, 1 - f, np.sin((1 - f) * angle) / safe)
+    wb = np.where(near, f, np.sin(f * angle) / safe)
+    out = wa[:, None] * a + wb[:, None] * b
+    return out / np.linalg.norm(out, axis=1, keepdims=True)
+
+
+def _matrix_track_at(*, track: _Track, t: np.ndarray) -> np.ndarray:
+    """Return a whole-matrix track's ``(len(t), 16)`` values at times ``t``.
+
+    Between keys the translation and scale are blended and the rotation
+    slerped, as importers decompose COLLADA matrix keys rather than blend
+    them element by element, which shears a turning node; at a key the
+    key's own matrix stands.
+    """
+    n = len(track.times)
+    span = np.clip(np.searchsorted(track.times, t, side="right") - 1, 0, n - 2)
+    t0, t1 = track.times[span], track.times[span + 1]
+    f = np.clip((t - t0) / (t1 - t0), 0.0, 1.0)
+    tr, quats, sc = track.trs
+    move = tr[span] + (tr[span + 1] - tr[span]) * f[:, None]
+    size = sc[span] + (sc[span + 1] - sc[span]) * f[:, None]
+    turn = _slerp(a=quats[span], b=quats[span + 1], f=f)
+    out = matrices_of_trs(translations=move, rotations=turn, scales=size).reshape(
+        len(t), 16
+    )
+    hit = np.searchsorted(track.times, t)
+    at_key = (hit < n) & (track.times[np.minimum(hit, n - 1)] == t)
+    out[at_key] = track.values[hit[at_key]]
+    return out
+
+
+def _track_at(*, track: _Track, t: np.ndarray) -> np.ndarray:
+    """Return a track's ``(len(t), width)`` values at times ``t``.
+
+    Before its first key a track holds its first value, after its last key
+    its last one.
+    """
+    n = len(track.times)
+    key = np.clip(np.searchsorted(track.times, t, side="right") - 1, 0, n - 1)
+    if track.interpolation == "STEP" or n == 1:
+        return track.values[key]
+    if track.trs is not None:
+        return _matrix_track_at(track=track, t=t)
+    if track.interpolation == "LINEAR":
+        return np.stack(
+            [np.interp(t, track.times, col) for col in track.values.T], axis=1
+        )
+    inside = (t > track.times[0]) & (t < track.times[-1])
+    out = track.values[key].copy()
+    if inside.any():
+        span = np.minimum(key[inside], n - 2)
+        out[inside] = _bezier_at(track=track, t=t[inside], span=span)
+    return out
+
+
+def _node_matrices(
+    *, elements: list[tuple[str, Any, np.ndarray]], tracks: list[_Track], t: np.ndarray
+) -> np.ndarray:
+    """Return a node's ``(len(t), 4, 4)`` local matrices at times ``t``."""
+    values = [np.tile(rest, (len(t), 1)) for _, _, rest in elements]
+    for track in tracks:
+        values[track.element][:, list(track.columns)] = _track_at(track=track, t=t)
+    out = np.tile(np.eye(4), (len(t), 1, 1))
+    for (kind, _, _), v in zip(elements, values, strict=True):
+        out = out @ matrices_of_element(kind=kind, values=v)
+    return out
+
+
+def _quat_angles(*, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Return the angles between rotations.
+
+    Parameters
+    ----------
+    a, b
+        ``(n, 4)`` unit quaternions ``(x, y, z, w)``.
+
+    Returns
+    -------
+    np.ndarray
+        ``(n,)`` angles, in degrees from 0 to 180, of the shortest turn
+        from each rotation of ``a`` to the one of ``b``.
+    """
+    dots = np.abs(np.sum(a * b, axis=1))
+    return np.degrees(2 * np.arccos(np.clip(dots, 0.0, 1.0)))
+
+
+def _angle_turns(
+    *,
+    elements: list[tuple[str, Any, np.ndarray]],
+    tracks: list[_Track],
+    times: np.ndarray,
+) -> np.ndarray:
+    """Return how far, in degrees, ``<rotate>`` angles turn between times.
+
+    The rotation at a span's ends and middle is the same for a turn of a
+    multiple of 720 degrees, so a span's turn is also read off the angle
+    each ``<rotate>`` ANGLE track changes by over it, summed over tracks.
+
+    Parameters
+    ----------
+    elements
+        The node's transform elements, as :func:`_node_elements` returns.
+    tracks
+        The node's bound channels.
+    times
+        The key times.
+
+    Returns
+    -------
+    np.ndarray
+        Per span between successive ``times``, the angles turned.
+    """
+    out = np.zeros(max(len(times) - 1, 0))
+    for tr in tracks:
+        if elements[tr.element][0] != "rotate" or 3 not in tr.columns:
+            continue
+        angle = _track_at(track=tr, t=times)[:, list(tr.columns).index(3)]
+        out += np.abs(np.diff(angle))
+    return out
+
+
+_UNFIT_KEYS = "its keys compose a matrix float32, the width glTF stores, cannot hold"
+
+
+def _fits_float32(*, values: np.ndarray) -> bool:
+    """Return whether float32 can hold every value.
+
+    Parameters
+    ----------
+    values
+        The values, of any shape.
+
+    Returns
+    -------
+    bool
+        True when every value is finite and at most float32's largest in
+        magnitude; NaN fails too, as its comparison is False.
+    """
+    return bool(values.size == 0 or np.abs(values).max() <= _FLOAT32_MAX)
+
+
+def _curve_tolerance(*, lo: np.ndarray, hi: np.ndarray) -> float:
+    """Return how far a blended translation or scale may stray from its curve.
+
+    Parameters
+    ----------
+    lo, hi
+        The least and greatest value per axis the node takes.
+
+    Returns
+    -------
+    float
+        A thousandth of the widest range, floored at a millionth of the
+        values' size, as rounding alone gives a still value a range of
+        about 1e-16.
+    """
+    size = max(np.abs(lo).max(), np.abs(hi).max(), 1.0)
+    return _REBUILD_CURVE_TOLERANCE * max((hi - lo).max(), 1e-6 * size)
+
+
+def _rebuild_times(
+    *,
+    elements: list[tuple[str, Any, np.ndarray]],
+    tracks: list[_Track],
+    budget: int,
+) -> tuple[np.ndarray, np.ndarray, str, int, bool, bool] | str:
+    """Return the key times and matrices that rebuild a node's animation.
+
+    Every track's keys are kept. When some track blends, the keys of a
+    ``STEP`` track get a key one float32 step before each of theirs, so
+    the step stays a step; a BEZIER span is split in four; a blending
+    span is split further until, at its middle, the translation and scale
+    stray from the straight line glTF blends by at most a thousandth of
+    their range over the node's keys and the middles of its spans, as a
+    BEZIER curve does, or a
+    translation a ``<rotate>`` before it swings on an arc; and a span
+    whose rotation turns more than 15 degrees, as measured through its
+    middle and by the angle its ``<rotate>`` ANGLE tracks change by, is
+    split until none does, since glTF slerps the rotation where COLLADA
+    blends the elements. A span whose handedness changes, where a scale
+    passes through zero, is at most halved per pass instead, as its
+    decomposed rotation jumps 180 degrees however short the piece; its
+    ANGLE tracks still split it. When the splits of a pass would add more keys
+    than ``budget`` leaves, the spans needing fewest pieces are split first,
+    until it runs out. A node spelled with one ``<matrix>`` that
+    a ``LINEAR`` channel animates is not split: its keys blend as glTF's
+    do. A ``LINEAR`` whole-``<matrix>`` channel beside other elements
+    blends its keys the same way, by decomposed translation, rotation and
+    scale, not element by element as COLLADA does, so the spans split are
+    split along that blend. A ``BEZIER`` whole-``<matrix>`` channel is
+    followed element by element, as COLLADA blends it: a node it turns
+    shrinks between keys, that shrink is part of the curve the keys
+    follow, and it widens the scale's range the tolerance is a share of.
+    Splitting stops after ``_REBUILD_MAX_PASSES`` passes; one more pass
+    then checks whether a span, other than one whose handedness changes,
+    still needs splitting.
+
+    Parameters
+    ----------
+    elements
+        The node's transform elements, as :func:`_node_elements` returns.
+    tracks
+        The node's bound channels.
+    budget
+        The most keys splitting spans may add to the node's.
+
+    Returns
+    -------
+    tuple or str
+        The key times; the node's local matrix at each; ``STEP`` when
+        every track steps, else ``LINEAR``; the keys splitting spans added;
+        whether splitting stopped at ``budget``; and whether a span still
+        turned or strayed too far once the passes ran out. Or the reason the node
+        cannot be rebuilt: a key, or the middle of a span, whose elements
+        compose to a matrix float32 cannot hold, which no decomposition
+        survives.
+    """
+    stepping = all(tr.interpolation == "STEP" for tr in tracks)
+    parts = [tr.times for tr in tracks]
+    holds = np.empty(0)
+    if not stepping:
+        steps = np.concatenate(
+            [tr.times[1:] for tr in tracks if tr.interpolation == "STEP"] + [holds]
+        )
+        below = np.nextafter(steps.astype(np.float32), np.float32(-np.inf))
+        holds = np.minimum(below.astype(np.float64), np.nextafter(steps, -np.inf))
+        parts.append(holds)
+        for tr in tracks:
+            if tr.interpolation == "BEZIER":
+                k = np.arange(1, _REBUILD_CURVE_PIECES) / _REBUILD_CURVE_PIECES
+                gaps = np.diff(tr.times)
+                parts.append((tr.times[:-1, None] + gaps[:, None] * k).ravel())
+    times = np.unique(np.concatenate(parts))
+    matrices = _node_matrices(elements=elements, tracks=tracks, t=times)
+    if not _fits_float32(values=matrices):
+        return _UNFIT_KEYS
+    if stepping:
+        return times, matrices, "STEP", 0, False, False
+    if len(elements) == 1 and all(tr.trs is not None for tr in tracks):
+        return times, matrices, "LINEAR", 0, False, False
+    base = len(times)
+    move, quats, size, _ = trs_of_matrices(matrices=matrices)
+    bounds = [(v.min(axis=0), v.max(axis=0)) for v in (move, size)]
+    check = ~np.isin(times[:-1], holds)
+    seed = np.ceil(
+        _angle_turns(elements=elements, tracks=tracks, times=times)
+        / _REBUILD_MAX_DEGREES
+    )
+    capped = unsettled = False
+    for done in range(_REBUILD_MAX_PASSES + 1):
+        spans = np.flatnonzero(check)
+        if not spans.size:
+            break
+        middle = (times[spans] + times[spans + 1]) / 2
+        mid_matrices = _node_matrices(elements=elements, tracks=tracks, t=middle)
+        if not _fits_float32(values=mid_matrices):
+            return _UNFIT_KEYS
+        mid_move, mid, mid_size, _ = trs_of_matrices(matrices=mid_matrices)
+        # A translation equal at both ends of a span may swing between them:
+        # the range the tolerance is a share of takes in every middle seen.
+        bounds = [
+            (np.minimum(lo, v.min(axis=0)), np.maximum(hi, v.max(axis=0)))
+            for (lo, hi), v in zip(bounds, (mid_move, mid_size), strict=True)
+        ]
+        tol_move, tol_size = (_curve_tolerance(lo=lo, hi=hi) for lo, hi in bounds)
+        turn = _quat_angles(a=quats[spans], b=mid) + _quat_angles(
+            a=mid, b=quats[spans + 1]
+        )
+        pieces = np.ceil(turn / _REBUILD_MAX_DEGREES)
+        # A BEZIER curve strays from the line, and so does a translation
+        # that a blended <rotate> before it swings on an arc.
+        stray = np.maximum(
+            np.abs(mid_move - (move[spans] + move[spans + 1]) / 2).max(axis=1)
+            / tol_move,
+            np.abs(mid_size - (size[spans] + size[spans + 1]) / 2).max(axis=1)
+            / tol_size,
+        )
+        # The stray of a straight piece shrinks with the square of its length.
+        pieces = np.maximum(pieces, np.ceil(np.sqrt(stray)))
+        # A reflection that comes or goes inside a span jumps the decomposed
+        # rotation by 180 degrees and the x scale through its sign however
+        # short the piece: such a span is only halved, so the pieces beside
+        # the flip are checked again without chasing the jump itself.
+        hand = np.sign(np.linalg.det(matrices[:, :3, :3]))
+        flips = (hand[spans] != hand[spans + 1]) | (
+            np.sign(np.linalg.det(mid_matrices[:, :3, :3])) != hand[spans]
+        )
+        pieces[flips] = np.minimum(pieces[flips], 2.0)
+        if seed is not None:
+            pieces = np.maximum(pieces, seed[spans])
+            seed = None
+        if done == _REBUILD_MAX_PASSES:
+            # A flip span is halved on every pass by design, never settled.
+            unsettled = not capped and bool((pieces[~flips] > 1).any())
+            break
+        room = budget - (len(times) - base)
+        # Past int64 the cast saturates or wraps by platform, and sums overflow.
+        pieces = np.minimum(pieces, room + 2).astype(np.int64)
+        if int((pieces - 1).sum()) > room:
+            capped = True
+            cheap = np.argsort(pieces, kind="stable")
+            fits = np.cumsum(pieces[cheap] - 1) <= room
+            pieces[cheap[~fits]] = 1
+        split = pieces > 1
+        if not split.any():
+            break
+        new = np.concatenate(
+            [
+                times[k] + (times[k + 1] - times[k]) * np.arange(1, p) / p
+                for k, p in zip(spans[split], pieces[split], strict=True)
+            ]
+        )
+        new_matrices = _node_matrices(elements=elements, tracks=tracks, t=new)
+        if not _fits_float32(values=new_matrices):
+            return _UNFIT_KEYS
+        new_move, new_quats, new_size, _ = trs_of_matrices(matrices=new_matrices)
+        # Only the pieces of a span just split need looking at again.
+        starts = np.zeros(len(times), dtype=bool)
+        starts[spans[split]] = True
+        times = np.concatenate([times, new])
+        order = np.argsort(times, kind="stable")
+        matrices = np.concatenate([matrices, new_matrices])[order]
+        move = np.concatenate([move, new_move])[order]
+        quats = np.concatenate([quats, new_quats])[order]
+        size = np.concatenate([size, new_size])[order]
+        check = np.concatenate([starts, np.ones(len(new), dtype=bool)])[order][:-1]
+        times = times[order]
+    return times, matrices, "LINEAR", len(times) - base, capped, unsettled
+
+
+def _bind_transform_channels(
+    *,
+    animations: list | tuple,
+    nodes: tuple[SceneNode, ...],
+    elements_of: dict[int, list | None | str],
+) -> list[tuple[list, dict[int, list[_Track]], set] | None]:
+    """Return each animation's channels bound to the elements they animate.
+
+    Parameters
+    ----------
+    animations
+        ``SceneData.global_attrs["animations"]``.
+    nodes
+        The scene's nodes.
+    elements_of
+        :func:`_node_elements` per node index, filled as nodes are met.
+
+    Returns
+    -------
+    list
+        Per animation, None when it holds no COLLADA transform channel;
+        else what :func:`_transform_track` gives each channel, the tracks
+        kept per node, and the ``(node, path)`` its other channels animate.
+        A channel that cannot be bound, or that animates values an earlier
+        channel of its animation does, is dropped with a warning.
+    """
+    out: list = []
+    for anim in animations:
+        channels = anim.get("channels", []) if isinstance(anim, dict) else None
+        samplers = anim.get("samplers", []) if isinstance(anim, dict) else None
+        if not isinstance(channels, (list, tuple)):
+            out.append(None)
+            continue
+        bound = [
+            _transform_track(
+                ch=ch, samplers=samplers, nodes=nodes, elements_of=elements_of
+            )
+            for ch in channels
+        ]
+        if all(b is None for b in bound):
+            out.append(None)
+            continue
+        taken = {
+            (ch["target"].get("node"), ch["target"].get("path"))
+            for ch, b in zip(channels, bound, strict=True)
+            if b is None
+            and isinstance(ch, dict)
+            and isinstance(ch.get("target"), dict)
+            and _sampler_index(ch, samplers) is not None
+            and _foreign_channel(ch, samplers, n_nodes=len(nodes)) is None
+        }
+        by_node: dict[int, list[_Track]] = {}
+        for b in bound:
+            if isinstance(b, str):
+                _warn_caller(f"glTF: an animation channel is not written: {b}.")
+            elif b is not None:
+                tracks = by_node.setdefault(b.node, [])
+                if any(
+                    tr.element == b.element and set(tr.columns) & set(b.columns)
+                    for tr in tracks
+                ):
+                    _warn_caller(
+                        "glTF: an animation channel is not written: an earlier "
+                        "channel of the animation already animates its values of "
+                        f"a transform element of node {b.node}."
+                    )
+                    continue
+                tracks.append(b)
+        out.append((bound, by_node, taken))
+    return out
+
+
+def _place_transform_tracks(*, bound: list) -> dict[tuple[int, int], list[_Track]]:
+    """Return which animation rebuilds which node, from which tracks.
+
+    COLLADA plays every animation at once, and some exporters write one
+    per curve, so the tracks of one node in several animations rebuild
+    one set of keys, in the first of them, when no two animate the same
+    value. Two that do cannot play together: in order, each animation
+    joins the first clip none of whose values it animates, else starts a
+    clip of its own, rebuilt in its first animation, with a warning when
+    a clip holds at rest values only another animates. An animation that already animates the node's
+    translation, rotation or scale with another channel gives none of its
+    tracks of the node, with a warning naming it; the tracks of the other
+    animations are placed without it.
+
+    Parameters
+    ----------
+    bound
+        :func:`_bind_transform_channels` of the animations.
+
+    Returns
+    -------
+    dict
+        The tracks per ``(animation, node)`` to rebuild there.
+    """
+    owners: dict[int, list[int]] = {}
+    for a, plan in enumerate(bound):
+        for node in plan[1] if plan is not None else ():
+            owners.setdefault(node, []).append(a)
+    out: dict[tuple[int, int], list[_Track]] = {}
+    for node, anims in owners.items():
+        native = {(node, p) for p in _TRS_PATHS}
+        for a in anims:
+            if native & bound[a][2]:
+                _warn_caller(
+                    f"glTF: the transform channels of node {node} in animation "
+                    f"{a} are not written: their keys would animate its "
+                    "translation, rotation and scale, which another channel of "
+                    "that animation already animates."
+                )
+        anims = [a for a in anims if not native & bound[a][2]]
+        if not anims:
+            continue
+        cells = [
+            {(tr.element, c) for tr in bound[a][1][node] for c in tr.columns}
+            for a in anims
+        ]
+        groups: list[tuple[list[int], set]] = []
+        for a, own in zip(anims, cells, strict=True):
+            for sources, held in groups:
+                if not held & own:
+                    sources.append(a)
+                    held |= own
+                    break
+            else:
+                groups.append(([a], set(own)))
+        every = set().union(*cells)
+        if len(groups) > 1 and any(held != every for _, held in groups):
+            _warn_caller(
+                f"glTF: animations animate the same transform values of node "
+                f"{node}, so they are written as separate clips, each holding "
+                "the values only the others animate at their rest values."
+            )
+        for sources, _ in groups:
+            out[sources[0], node] = [tr for s in sources for tr in bound[s][1][node]]
+    return out
+
+
+def _rebuild_transform_channels(
+    *, animations: Any, nodes: tuple[SceneNode, ...]
+) -> Any:
+    """Return the animations with COLLADA transform channels rebuilt as TRS.
+
+    The channels :func:`_transform_track` binds are grouped by node, across
+    animations as :func:`_place_transform_tracks` says: each node's are
+    replaced, at the place of the first, by a translation, a rotation and
+    a scale channel over the times :func:`_rebuild_times` picks, each key
+    the node's elements composed at that time and split into the three;
+    their samplers are appended to the animation's. Every other channel
+    and sampler is kept as is, so its index does not move. An animation
+    whose every channel was rebuilt into an earlier one is left without
+    channels, which the encoder skips: its name is not written and the
+    animations after it move up one index. Successive
     quaternions keep the same hemisphere, so glTF's slerp takes the short
-    way between keys as the matrix did.
+    way between keys. The keys splitting spans adds are capped for the
+    whole write, with one warning once they reach the cap. Each node to
+    rebuild may add at most an even share of what is left of the cap when
+    its turn comes, so one node cannot spend it all; what a node leaves
+    unspent passes to the nodes after it. Spans still turning or straying
+    too far once :func:`_rebuild_times` runs out of passes get one warning
+    per write too.
+
+    A channel it cannot rebuild is dropped with a warning, as are an
+    animation's every channel of a node when another channel of that
+    animation already animates the node's translation, rotation or scale,
+    and a second channel on the values of an element an earlier one
+    animates.
 
     Parameters
     ----------
@@ -2959,67 +3815,91 @@ def _split_matrix_channels(animations: Any, nodes: tuple[SceneNode, ...]) -> Any
     """
     if not isinstance(animations, (list, tuple)):
         return animations
+    elements_of: dict[int, list | None | str] = {}
+    bound = _bind_transform_channels(
+        animations=animations, nodes=nodes, elements_of=elements_of
+    )
+    placed = _place_transform_tracks(bound=bound)
+    budget = _REBUILD_MAX_KEYS
+    pending = len(placed)
+    capped = unsettled = False
     out: list = []
-    for anim in animations:
-        channels = anim.get("channels", []) if isinstance(anim, dict) else None
-        samplers = anim.get("samplers", []) if isinstance(anim, dict) else None
-        if not isinstance(channels, (list, tuple)):
+    for a, (anim, plan) in enumerate(zip(animations, bound, strict=True)):
+        if plan is None:
             out.append(anim)
             continue
-        wholes = [_whole_matrix_channel(ch, samplers, nodes) for ch in channels]
-        if all(w is None for w in wholes):
-            out.append(anim)
-            continue
-        taken = {
-            (ch["target"].get("node"), ch["target"].get("path"))
-            for ch, w in zip(channels, wholes, strict=True)
-            if w is None
-            and isinstance(ch, dict)
-            and isinstance(ch.get("target"), dict)
-            and _sampler_index(ch, samplers) is not None
-            and _foreign_channel(ch, samplers, n_nodes=len(nodes)) is None
-        }
         new_channels: list = []
-        new_samplers = list(samplers)
-        for ch, whole in zip(channels, wholes, strict=True):
-            if whole is None:
+        new_samplers = list(anim.get("samplers", []))
+        for ch, b in zip(anim["channels"], plan[0], strict=True):
+            if b is None:
                 new_channels.append(ch)
                 continue
-            node, times, keys, interp = whole
-            paths = {(node, p) for p in _TRS_PATHS}
-            if paths & taken:
+            if isinstance(b, str) or plan[1].get(b.node, [None])[0] is not b:
+                continue
+            node = b.node
+            if (a, node) not in placed:
+                continue
+            elements = elements_of[node]
+            if elements is None:
+                elements = [("matrix", None, np.asarray(nodes[node].matrix).ravel())]
+            share = budget // pending
+            pending -= 1
+            # Elements may compose past float64 before the keys are checked.
+            with np.errstate(over="ignore", invalid="ignore"):
+                rebuilt = _rebuild_times(
+                    elements=elements, tracks=placed[a, node], budget=share
+                )
+            if isinstance(rebuilt, str):
                 _warn_caller(
-                    "glTF: an animation channel is not written: its matrix keys "
-                    f"would animate the translation, rotation and scale of node "
-                    f"{node}, which another channel of the animation already "
-                    "animates."
+                    f"glTF: the transform animation of node {node} is not "
+                    f"written: {rebuilt}."
                 )
                 continue
-            taken |= paths
-            split = [trs_of_matrix(k) for k in keys]
-            if not all(exact for *_, exact in split):
+            times, keys, interp, added, cut, short = rebuilt
+            budget -= added
+            if cut and not capped:
+                capped = True
                 _warn_caller(
-                    f"glTF: a matrix animation key of node {node} holds a shear "
+                    "glTF: the transform animations turn or curve so far "
+                    f"between their keys that more than {_REBUILD_MAX_KEYS} "
+                    "keys would be added to follow them, or more than a "
+                    "node's share of those; past that, glTF slerps and "
+                    "blends the rest of the way."
+                )
+            if short and not unsettled:
+                unsettled = True
+                _warn_caller(
+                    "glTF: the transform animations still turn more than "
+                    f"{_REBUILD_MAX_DEGREES:g} degrees, or stray from their "
+                    f"curve, between some keys after {_REBUILD_MAX_PASSES} "
+                    "rounds of splitting; there glTF slerps and blends the "
+                    "rest of the way."
+                )
+            move, quats, size, exact = trs_of_matrices(matrices=keys)
+            if not all(_fits_float32(values=v) for v in (times, move, size)):
+                _warn_caller(
+                    f"glTF: the transform animation of node {node} is not "
+                    "written: its keys hold a translation or scale float32, "
+                    "the width glTF stores, cannot."
+                )
+                continue
+            if not exact.all():
+                _warn_caller(
+                    f"glTF: a transform animation key of node {node} holds a shear "
                     "or projection, which translation, rotation and scale "
                     "cannot; it is dropped from the key."
                 )
-            flips = np.diff([np.prod(sc) < 0 for _, _, sc, _ in split])
-            if flips.any():
+            if np.diff(np.prod(size, axis=1) < 0).any():
                 _warn_caller(
-                    f"glTF: the matrix animation keys of node {node} change "
+                    f"glTF: the transform animation keys of node {node} change "
                     "handedness between keys; the reflection is a negative x "
                     "scale, so the keys between two such keys swing through it."
                 )
-            quats = np.array([q for _, q, _, _ in split])
-            for k in range(1, len(quats)):
-                if np.dot(quats[k], quats[k - 1]) < 0:
-                    quats[k] = -quats[k]
-            tracks = (
-                np.array([t for t, _, _, _ in split]),
-                quats,
-                np.array([sc for _, _, sc, _ in split]),
-            )
-            for path, values in zip(_TRS_PATHS, tracks, strict=True):
+            flip = np.sum(quats[1:] * quats[:-1], axis=1) < 0
+            # Each flip turns every quaternion after it to the other side.
+            sign = np.r_[1.0, np.where(np.cumsum(flip) % 2, -1.0, 1.0)]
+            values = (move, quats * sign[:, None], size)
+            for path, track in zip(_TRS_PATHS, values, strict=True):
                 new_channels.append(
                     {
                         "sampler": len(new_samplers),
@@ -3027,7 +3907,7 @@ def _split_matrix_channels(animations: Any, nodes: tuple[SceneNode, ...]) -> Any
                     }
                 )
                 new_samplers.append(
-                    {"times": times, "values": values, "interpolation": interp}
+                    {"times": times, "values": track, "interpolation": interp}
                 )
         out.append({**anim, "channels": new_channels, "samplers": new_samplers})
     return out
