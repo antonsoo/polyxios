@@ -489,6 +489,7 @@ Packaging
 
 - Python 3.15 wheels are built for a release, for Linux, macOS and
   Windows, and the distribution declares 3.15 among its classifiers.
+- The PyPI page and the GitHub repository link to GitHub Sponsors.
 
 - The PyPI page now carries the project links (homepage, documentation,
   changelog, issue tracker, source), trove classifiers, keywords and an

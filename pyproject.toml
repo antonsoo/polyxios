@@ -55,6 +55,7 @@ Documentation = "https://polyxios.org/stable/"
 Changelog = "https://polyxios.org/stable/changelog.html"
 Issues = "https://github.com/fury-gl/polyxios/issues"
 Source = "https://github.com/fury-gl/polyxios"
+Funding = "https://github.com/sponsors/skoudoro"
 
 [project.optional-dependencies]
 dev = [
