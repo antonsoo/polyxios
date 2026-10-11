@@ -4,7 +4,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/polyxios.svg)](https://pypi.org/project/polyxios/)
 [![conda-forge](https://img.shields.io/conda/vn/conda-forge/polyxios.svg)](https://anaconda.org/conda-forge/polyxios)
-[![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://pypi.org/project/polyxios/)
+[![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14%20%7C%203.15-blue.svg)](https://pypi.org/project/polyxios/)
 [![License](https://img.shields.io/github/license/fury-gl/polyxios.svg)](https://github.com/fury-gl/polyxios/blob/master/LICENSE)
 [![Tests](https://github.com/fury-gl/polyxios/actions/workflows/test.yml/badge.svg)](https://github.com/fury-gl/polyxios/actions/workflows/test.yml)
 
@@ -42,6 +42,7 @@ pip install "polyxios[hdf5]"
 Exodus II is a netCDF file and needs [netCDF4](https://unidata.github.io/netcdf4-python/)
 the same way - `pip install "polyxios[netcdf]"` - and a LAZ-compressed LAS file needs
 [lazrs](https://github.com/laz-rs/laz-rs-python) - `pip install "polyxios[laz]"`.
+`pxios viz` renders through [FURY](https://fury.gl) - `pip install "polyxios[viz]"`.
 
 ---
 
@@ -190,7 +191,8 @@ Which arrays can be views depends on how the format lays them out. `.vtu`
 and `.vtp` with a raw appended section (VTK's default output, and
 `write(..., appended=True)`), `.xdmf` over a binary or contiguous-HDF5
 sidecar, `.splat`, and binary `.vtk` in the v5.1 layout map their vertices,
-connectivity and attributes; binary `.ply`, `.meshb` and v4.2 `.vtk` map
+connectivity and attributes; binary `.pcd` and uncompressed `.las` map
+their vertices and every field; binary `.ply`, `.meshb` and v4.2 `.vtk` map
 their vertices and decode their cells, whose on-disk form interleaves counts
 or references with the indices. Binary STL's `lazy=True` skips vertex
 deduplication instead - three vertices per triangle, copied - because a
@@ -218,7 +220,7 @@ Use `read_scene` / `write_scene` to preserve the structure; `read` flattens to a
 | Format | Extension | Read | Write | Notes |
 |--------|-----------|------|-------|-------|
 | glTF 2.0 | `.gltf` `.glb` | ✓ | ✓ | `read_scene` returns full hierarchy, PBR materials, animations; `read()` flattens with a warning |
-| COLLADA | `.dae` | ✓ | ✓ | `read_scene` returns nodes, effects as materials and animations; skins not yet read; `read()` flattens with a warning |
+| COLLADA | `.dae` | ✓ | ✓ | `read_scene` returns nodes, effects as materials, skins and animations; `read()` flattens with a warning |
 
 ### Surface, point & interchange
 

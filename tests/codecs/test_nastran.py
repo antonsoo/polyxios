@@ -1674,6 +1674,20 @@ def test_ctriax6_interleaves_its_corner_and_midside_grids(tmp_path) -> None:
     assert poly.connectivity.tolist() == [0, 2, 4, 1, 3, 5]
 
 
+def test_ctriax6_is_written_back_as_ctria6_in_vtk_order(tmp_path) -> None:
+    """A quadratic triangle has one card on write, whatever card it came from."""
+    deck = _deck(_card("CTRIAX6", "1", "9", *(str(i + 1) for i in range(6))), 6)
+    poly = read(_write(tmp_path, deck))
+    out = tmp_path / "out.bdf"
+    write(poly, out)
+    cards = [line.split(",")[0] for line in out.read_text().splitlines()]
+    assert "CTRIA6" in cards
+    assert "CTRIAX6" not in cards
+    back = read(out)
+    assert back.element_types.tolist() == [ELEMENT_TYPES["quadratic_triangle"]]
+    assert back.connectivity.tolist() == poly.connectivity.tolist()
+
+
 def test_ctriax6_without_its_midside_grids_is_a_linear_triangle(tmp_path) -> None:
     """G2, G4 and G6 are optional, and a card without them is still a triangle."""
     deck = _deck(_card("CTRIAX6", "1", "9", "1", "", "2", "", "3", ""), 3)

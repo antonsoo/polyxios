@@ -4,7 +4,7 @@ import warnings
 
 import numpy as np
 
-from polyxios._element_types import ELEMENT_TYPES
+from polyxios._element_types import ELEMENT_TYPES, ELEMENT_TYPES_INV
 from polyxios._io import (
     Source,
     can_seek,
@@ -151,9 +151,6 @@ def read(
 def write(poly: PolyData, path: Source, *, binary: bool = True) -> None:
     """Serialise PolyData to an STL file (triangles only).
 
-    Non-triangle surface elements are skipped. Volume/line elements are
-    also skipped.
-
     Parameters
     ----------
     poly
@@ -161,10 +158,23 @@ def write(poly: PolyData, path: Source, *, binary: bool = True) -> None:
     path
         Output file path.
     binary
-        If True (default), write binary STL.
+        If True, write binary STL; otherwise ASCII.
+
+    Raises
+    ------
+    CodecError
+        If the mesh holds no triangle, a triangle whose connectivity is not
+        three vertices, or a triangle referencing a vertex that does not exist.
+
+    Warns
+    -----
+    UserWarning
+        When the mesh holds elements other than triangles: they have no STL
+        spelling and are skipped, the warning naming their types.
     """
     tri_code = ELEMENT_TYPES["triangle"]
-    tri_indices = np.where(poly.element_types == tri_code)[0]
+    is_tri = poly.element_types == tri_code
+    tri_indices = np.flatnonzero(is_tri)
 
     if len(tri_indices) == 0:
         raise CodecError("STL requires triangle elements; none found in PolyData.")
@@ -178,6 +188,24 @@ def write(poly: PolyData, path: Source, *, binary: bool = True) -> None:
     starts = poly.offsets[tri_indices]
     conn_indices = starts[:, None] + np.arange(3)
     vertex_indices = poly.connectivity[conn_indices]
+    n_verts = verts.shape[0]
+    bad = (vertex_indices < 0) | (vertex_indices >= n_verts)
+    if bad.any():
+        row, col = np.argwhere(bad)[0]
+        where = f"0..{n_verts - 1}" if n_verts else "an empty vertex array"
+        raise CodecError(
+            f".stl: element {int(tri_indices[row])} references vertex"
+            f" {int(vertex_indices[row, col])}, outside {where}."
+        )
+
+    if len(tri_indices) < len(is_tri):
+        other = np.unique(poly.element_types[~is_tri])
+        names = sorted(ELEMENT_TYPES_INV.get(int(c), str(int(c))) for c in other)
+        warnings.warn(
+            f".stl: {len(is_tri) - len(tri_indices)} element(s) that are not"
+            f" triangles ({', '.join(names)}) have no STL spelling; skipped.",
+            stacklevel=2,
+        )
     facet_verts = verts[vertex_indices].astype(np.float32)
 
     normals = _compute_normals(facet_verts)
