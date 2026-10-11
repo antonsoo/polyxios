@@ -4,7 +4,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/polyxios.svg)](https://pypi.org/project/polyxios/)
 [![conda-forge](https://img.shields.io/conda/vn/conda-forge/polyxios.svg)](https://anaconda.org/conda-forge/polyxios)
-[![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://pypi.org/project/polyxios/)
+[![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14%20%7C%203.15-blue.svg)](https://pypi.org/project/polyxios/)
 [![License](https://img.shields.io/github/license/fury-gl/polyxios.svg)](https://github.com/fury-gl/polyxios/blob/master/LICENSE)
 [![Tests](https://github.com/fury-gl/polyxios/actions/workflows/test.yml/badge.svg)](https://github.com/fury-gl/polyxios/actions/workflows/test.yml)
 
