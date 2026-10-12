@@ -131,7 +131,11 @@ jobs:
   publish_pypi:
     name: PyPI
     needs: [github_release]
-    if: ${{ !contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, 'test') }}
+    # Trusted publishing is bound to fury-gl/polyxios: a tag pushed to a fork
+    # still builds and drafts its GitHub release, but never reaches PyPI.
+    if: >-
+      github.repository == 'fury-gl/polyxios'
+      && !contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, 'test')
     runs-on: ubuntu-latest
     environment:
       name: pypi
