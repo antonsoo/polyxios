@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use polyxios in your work, please cite it as below."
+type: software
+title: polyxios
+abstract: >-
+  polyxios is a fast, dependency-light Python library to read and write 3D
+  mesh, scene and point-cloud file formats, with a single in-memory
+  representation shared by every codec.
+authors:
+  - given-names: Serge
+    family-names: Koudoro
+  - given-names: Praneeth
+    family-names: Shetty
+  - given-names: Maharshi
+    family-names: Gor
+version: 0.5.0
+license: BSD-3-Clause
+url: "https://polyxios.org"
+repository-code: "https://github.com/fury-gl/polyxios"
+keywords:
+  - mesh
+  - point cloud
+  - 3D
+  - file formats
+  - I/O
+  - scientific computing
