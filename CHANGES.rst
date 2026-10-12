@@ -6,8 +6,8 @@ Changelog
 
 .. _changes_0.5.0:
 
-0.5.0 (upcoming)
-----------------
+0.5.0 (2026-10-11)
+------------------
 
 New features
 ~~~~~~~~~~~~
@@ -546,6 +546,77 @@ Packaging
   to polyxios.org from its head and from each section that has a fuller
   page on the site, and the two links that pointed at ``docs/*.rst`` by
   relative path, which rendered broken on PyPI, now point at the site.
+
+
+GitHub stats for 2026/09/09 - 2026/10/11 (tag: v0.4.1)
+
+These lists are automatically generated and may be incomplete or contain duplicates.
+
+The following 3 authors contributed 105 commits.
+
+* Maharshi Gor
+* Serge Koudoro
+* dependabot[bot]
+
+
+We closed a total of 51 issues, 45 pull requests and 6 regular issues.
+
+Pull Requests (45):
+
+* :ghpull:`108`: BF: spell XML-forbidden regex ranges as escapes in a raw string
+* :ghpull:`107`: CI: Python 3.15 support, and a docs correctness pass
+* :ghpull:`106`: NF: glTF write rebuilds COLLADA transform animations as TRS
+* :ghpull:`105`: NF: COLLADA and glTF carry tangents across, as a TEXTANGENT frame
+* :ghpull:`104`: NF: COLLADA keeps glTF PBR terms in a polyxios extra technique
+* :ghpull:`102`: NF: glTF write\_scene writes skins, so a skinned scene keeps its rig
+* :ghpull:`103`: MNT: Bump pypa/cibuildwheel from 4.2.1 to 4.3.0 in the actions group
+* :ghpull:`101`: NF: COLLADA skins read and written, so a rigged glTF keeps its skin
+* :ghpull:`100`: BF: glTF read shares vertices across primitives with the same accessors
+* :ghpull:`96`: NF: COLLADA animations read and written, glTF animations baked on write
+* :ghpull:`97`: MNT: update pre-commit hooks
+* :ghpull:`90`: NF: COLLADA (.dae) read and write as a scene
+* :ghpull:`94`: BF: glTF animation write fixes, skin inverse bind matrices decoded
+* :ghpull:`92`: MNT: update pre-commit hooks
+* :ghpull:`89`: NF: VTKHDF (.vtkhdf) and PVD (.pvd) read and write, with time series
+* :ghpull:`88`: NF: LAS and LAZ point clouds (.las, .laz) read and write
+* :ghpull:`87`: NF: PCD and ASCII point clouds (.pcd, .xyz, .pts, .ptx) read and write
+* :ghpull:`86`: NF: lazy reads hand back views of the mapping; VTU/VTP appended-raw writer
+* :ghpull:`85`: NF: read and write 3MF
+* :ghpull:`84`: Fix CLI examples, homepage transcript and codec warning output
+* :ghpull:`83`: NF: read and write Exodus II
+* :ghpull:`82`: DOC: sync README and docs with the code
+* :ghpull:`81`: NF: MED, CGNS, H5M and HMF codecs over one HDF5 plumbing module
+* :ghpull:`80`: NF: read and write XDMF, the time series through the helper
+* :ghpull:`79`: MNT: update pre-commit hooks
+* :ghpull:`78`: NF: write SVG pictures, a write-only projection of the mesh onto a plane
+* :ghpull:`77`: Add glTF 2.0 / GLB read-write support and SceneData scene-graph container
+* :ghpull:`76`: MNT: update pre-commit hooks
+* :ghpull:`75`: MNT: check XML-spellable array names by code point, not a regex range
+* :ghpull:`74`: DOC: bring bot-authored commits under the message convention
+* :ghpull:`73`: Potential fix for code scanning alert no. 3: Workflow does not contain permissions
+* :ghpull:`72`: NF: ANSYS Fluent meshes read and write as a sniffed .msh and .fluent
+* :ghpull:`71`: MNT: README badges that read PyPI fields the release has not shipped
+* :ghpull:`68`: NF: new codec - PERMAS decks read and write as .dato, .post and a sniffed .dat
+* :ghpull:`70`: MNT: PyPI page carries project links, classifiers and keywords
+* :ghpull:`69`: MNT: Bump pypa/cibuildwheel from 4.2.0 to 4.2.1 in the actions group
+* :ghpull:`67`: MNT: Python 3.12 is the lowest version supported
+* :ghpull:`66`: BF: an unsearchable directory still refuses on Python 3.14
+* :ghpull:`65`: BF: the docs site keeps one directory per release, named for it
+* :ghpull:`64`: DOC: the 0.4.1 notes say what the release machinery got wrong
+* :ghpull:`63`: BF: a version can be published from a ref that is not its tag
+* :ghpull:`62`: BF: the release notes reach gh through the environment
+* :ghpull:`61`: BF: the new upcoming section opens the changelog, not the middle
+* :ghpull:`60`: DOC: the README and the guides say what 0.4.0 added
+* :ghpull:`59`: NF: OBJ keeps the texture coordinates a seam gives two of
+
+Issues (6):
+
+* :ghissue:`99`: COLLADA animations: follow-ups from the #96 review
+* :ghissue:`93`: glTF write: rebuild COLLADA transform-element animations as TRS
+* :ghissue:`95`: glTF -> COLLADA conversion: what is lost, and what can be recovered
+* :ghissue:`98`: BF: glTF read duplicates vertices shared across a mesh's primitives
+* :ghissue:`91`: COLLADA write drops glTF TRS animations
+* :ghissue:`58`: OBJ codec: texture coordinates (vt) parsed but not stored in vertex\_attrs
 
 .. _changes_0.4.1:
 
