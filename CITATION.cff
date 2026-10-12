@@ -14,6 +14,7 @@ authors:
   - given-names: Maharshi
     family-names: Gor
 version: 0.5.0
+date-released: "2026-10-11"
 license: BSD-3-Clause
 url: "https://polyxios.org"
 repository-code: "https://github.com/fury-gl/polyxios"
