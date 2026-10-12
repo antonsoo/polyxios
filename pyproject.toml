@@ -83,8 +83,8 @@ doc = [
 viz = [
     "fury>=2",
 ]
-# The HDF5-backed formats: XDMF's usual heavy data, and MED, CGNS, H5M and
-# HMF outright. Without it XDMF still reads and writes its inline and
+# The HDF5-backed formats: XDMF's usual heavy data, and MED, CGNS, H5M, HMF
+# and VTKHDF outright. Without it XDMF still reads and writes its inline and
 # raw-binary flavours, and every HDF5 file or reference is refused with the
 # install line that fixes it.
 hdf5 = [

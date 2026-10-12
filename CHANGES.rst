@@ -132,6 +132,34 @@ New features
   warn. A value that is not JSON raises
   :class:`~polyxios.exceptions.CodecError` rather than a bare
   ``TypeError``, and a NaN in one no longer blames the mesh data.
+- A glTF material written to COLLADA keeps its PBR terms. Metallic,
+  roughness, the alpha mask and its cutoff, the metallic-roughness and
+  occlusion textures and a tint beside a texture, which the common profile
+  has no slot for and a write lost, some without a warning, go into an
+  ``<extra><technique profile="polyxios">`` the reader restores them from;
+  other readers skip it and see the phong approximation. A term that is not
+  a finite number is refused on write, and one in the extra that is not
+  finite numbers of the right count is ignored on read with a warning.
+- Tangents cross between glTF and COLLADA. A COLLADA write spells a glTF
+  tangent as a ``TEXTANGENT`` of its xyz and, when the mesh has normals, a
+  ``TEXBINORMAL`` on the side its ``w`` gives; a glTF write rebuilds
+  ``TANGENT`` from the first complete frame of set 0, or a lone tangent,
+  where every tangent set used to be dropped. A frame glTF cannot hold - no
+  normals, a tangent of zero or non-finite length, a shape other than four
+  numbers per vertex - is left out with a warning, so a glb -> dae -> glb
+  round trip keeps its tangents.
+- glTF write rebuilds COLLADA transform animations as translation, rotation
+  and scale. A channel on a ``<rotate>`` angle, a ``<translate>`` member or
+  a ``<matrix>`` beside other elements was skipped, so rigs from Blender,
+  Maya or 3ds Max lost their animation; each node's channels are now
+  applied to the elements it was read with, composed at the union of their
+  key times and split. STEP keys keep their steps, BEZIER keys are sampled
+  along their curve in each of the three tangent layouts exporters write,
+  and spans are split until glTF's straight blend and slerp stray from
+  COLLADA's by at most a thousandth of the range or 15 degrees, capped per
+  write. Animations that animate the same values become separate clips.
+  The element matrices and the TRS split live in ``polyxios._trs``, shared
+  by both codecs.
 - PVD (``.pvd``), ParaView's collection of datasets over time, is read and
   written. Every dataset at one ``timestep`` is read through its own codec
   and merged, tagged by ``group`` or ``part_<n>``, with the step's time
@@ -429,6 +457,24 @@ Bug fixes
   stay strictly increasing once stored as float32, and the first never
   turns negative.
 
+- glTF read keeps one vertex set for primitives sharing their accessors, as
+  the one-primitive-per-material meshes ``write_scene`` emits do. Each
+  primitive was read as a mesh of its own and merged, so every round trip
+  multiplied the vertex count by the number of materials and cut
+  connectivity across them. Element decoding is vectorised: a million lines
+  or fan triangles read in 0.03 s instead of 0.5 to 1.6 s. A primitive with
+  no attributes object, an index naming nothing in the file (a negative one
+  read the last accessor), indices that are signed, float or past the
+  vertex set (a uint32 above 2**31 wrapped to -1), or an attribute whose
+  length differs from ``POSITION`` raises ``CodecError``.
+
+- The COLLADA animation reader no longer refuses valid documents with many
+  instanced nodes: a channel missing its transform counts once per
+  ``<node>``, not per copy, and the target cap is four times the node cap.
+  A BEZIER or HERMITE sampler missing a tangent is dropped with a warning
+  naming it instead of written for strict readers to reject, and a channel
+  dropped on a copy alone no longer claims to reach every instance.
+
 - A 3MF whose model part inflates past a gigabyte - ten million vertices -
   is read. The part was inflated whole and handed to the XML parser in one
   buffer, which expat refuses past that size with ``out of memory``, and
@@ -490,6 +536,9 @@ Packaging
 - Python 3.15 wheels are built for a release, for Linux, macOS and
   Windows, and the distribution declares 3.15 among its classifiers.
 - The PyPI page and the GitHub repository link to GitHub Sponsors.
+- ``SECURITY.md`` says how to report a vulnerability privately and what
+  counts as one in a file parser; ``CITATION.cff`` gives the citation GitHub
+  shows on the repository page.
 
 - The PyPI page now carries the project links (homepage, documentation,
   changelog, issue tracker, source), trove classifiers, keywords and an
