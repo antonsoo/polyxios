@@ -221,9 +221,10 @@ def test_binary_polydata_lines() -> None:
     poly = read(tmp)
     assert len(poly.vertices) == 4
     assert len(poly.element_types) == 1
+    np.testing.assert_array_equal(poly.offsets, [0, 4])
+    np.testing.assert_array_equal(poly.connectivity, [0, 1, 2, 3])
+    validate(poly)
     # poly_line (cnt=4 > 2)
-    from polyxios._element_types import ELEMENT_TYPES
-
     assert int(poly.element_types[0]) == ELEMENT_TYPES["poly_line"]
     np.testing.assert_allclose(poly.vertices[0], [0, 0, 0])
     np.testing.assert_allclose(poly.vertices[3], [3, 0, 0])
@@ -246,11 +247,94 @@ def test_binary_polydata_polygons() -> None:
     tmp = _write_tmp(content)
     poly = read(tmp)
 
-    from polyxios._element_types import ELEMENT_TYPES
-
     assert len(poly.element_types) == 2
     assert int(poly.element_types[0]) == ELEMENT_TYPES["triangle"]
     assert int(poly.element_types[1]) == ELEMENT_TYPES["quad"]
+    np.testing.assert_array_equal(poly.offsets, [0, 3, 7])
+    np.testing.assert_array_equal(poly.connectivity, [0, 1, 2, 0, 1, 3, 2])
+    validate(poly)
+
+
+def test_binary_polydata_offsets_span_every_section() -> None:
+    """Each cell of a binary v4.2 POLYDATA gets one offset, continuing from
+    the cells of the section before it, with no empty cell at the start."""
+    content = (
+        b"# vtk DataFile Version 4.2\nlines\nBINARY\nDATASET POLYDATA\n"
+        + b"POINTS 5 float\n"
+        + np.zeros(15, dtype=">f4").tobytes()
+        + b"\nLINES 2 7\n"
+        + np.array([3, 0, 1, 2, 2, 3, 4], dtype=">i4").tobytes()
+        + b"\nPOLYGONS 1 4\n"
+        + np.array([3, 0, 2, 4], dtype=">i4").tobytes()
+        + b"\n"
+    )
+    poly = read(_write_tmp(content))
+    np.testing.assert_array_equal(poly.offsets, [0, 3, 5, 8])
+    np.testing.assert_array_equal(poly.connectivity, [0, 1, 2, 3, 4, 0, 2, 4])
+    np.testing.assert_array_equal(
+        poly.element_types,
+        [ELEMENT_TYPES["poly_line"], ELEMENT_TYPES["line"], ELEMENT_TYPES["triangle"]],
+    )
+    validate(poly)
+
+
+_POLYDATA_SECTIONS = (
+    ("VERTICES", ([0], [1, 2])),
+    ("LINES", ([0, 1, 2], [3, 4])),
+    ("POLYGONS", ([0, 1, 2], [0, 1, 2, 3], [0, 1, 2, 3, 4])),
+    ("TRIANGLE_STRIPS", ([0, 1, 2, 3, 5],)),
+)
+
+
+def _polydata_file(*, binary: bool) -> bytes:
+    """Spell one POLYDATA mesh, every section and a cell array, in v4.2.
+
+    Parameters
+    ----------
+    binary
+        Write the data sections big-endian binary rather than ASCII.
+
+    Returns
+    -------
+    bytes
+        The whole file.
+    """
+    pts = np.arange(18, dtype=np.float64)
+    n_cells = sum(len(cells) for _, cells in _POLYDATA_SECTIONS)
+    values = np.arange(n_cells, dtype=np.float64)
+
+    def block(arr: np.ndarray, dtype: str) -> bytes:
+        if binary:
+            return arr.astype(dtype).tobytes() + b"\n"
+        return " ".join(str(v) for v in arr.tolist()).encode() + b"\n"
+
+    mode = b"BINARY" if binary else b"ASCII"
+    out = [b"# vtk DataFile Version 4.2\nt\n" + mode + b"\nDATASET POLYDATA\n"]
+    out += [b"POINTS 6 float\n", block(pts, ">f4")]
+    for kind, cells in _POLYDATA_SECTIONS:
+        stream = np.array([v for c in cells for v in (len(c), *c)])
+        out += [f"{kind} {len(cells)} {stream.size}\n".encode(), block(stream, ">i4")]
+    out.append(
+        f"CELL_DATA {n_cells}\nSCALARS s double 1\nLOOKUP_TABLE default\n".encode()
+    )
+    out.append(block(values, ">f8"))
+    return b"".join(out)
+
+
+def test_polydata_binary_matches_ascii() -> None:
+    """A POLYDATA mesh reads the same whether its sections are ASCII or binary,
+    each of the four cell sections and the cell array over all of them."""
+    ascii_poly = read(_write_tmp(_polydata_file(binary=False)))
+    binary_poly = read(_write_tmp(_polydata_file(binary=True)))
+    validate(binary_poly)
+    for name in ("vertices", "connectivity", "offsets", "element_types"):
+        np.testing.assert_array_equal(
+            getattr(binary_poly, name), getattr(ascii_poly, name), err_msg=name
+        )
+    np.testing.assert_array_equal(
+        binary_poly.element_attrs["s"], ascii_poly.element_attrs["s"]
+    )
+    np.testing.assert_array_equal(binary_poly.offsets, [0, 1, 3, 6, 8, 11, 15, 20, 25])
 
 
 def test_binary_polydata_lazy_raises() -> None:

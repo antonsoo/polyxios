@@ -1572,6 +1572,7 @@ def _read_polydata_ascii(path: Source) -> PolyData:
             where = f"line {i + 1}"
             n_cells = _attr_count(parts, 1, where)
             total_vals = _attr_count(parts, 2, where)
+            base = off_list[-1]
             i += 1
 
             if i < n_lines and lines[i].strip().upper().startswith("OFFSETS"):
@@ -1579,7 +1580,6 @@ def _read_polydata_ascii(path: Source) -> PolyData:
                 # the cells are an offsets array and a flat connectivity one,
                 # and the first number on the header line counts the offsets.
                 conn_v51, off_v51, i = _parse_v51_cells_ascii(lines, i)
-                base = off_list[-1]
                 conn_list.extend(conn_v51.tolist())
                 off_list.extend((base + off_v51[1:]).tolist())
                 counts = np.diff(off_v51)
@@ -1604,7 +1604,6 @@ def _read_polydata_ascii(path: Source) -> PolyData:
                 _whole_numbers(tokens[:total_vals], kind), n_cells, kind
             )
             conn_list.extend(cells)
-            base = off_list[-1]
             off_list.extend(base + run for run in accumulate(widths))
             type_list.extend(_polydata_cell_type(kind, cnt) for cnt in widths)
             n_elems += n_cells
@@ -1771,6 +1770,7 @@ def _parse_binary_polydata_body(
             where = f"byte {line_start}"
             n_cells = _attr_count(parts, 1, where)
             total_vals = _attr_count(parts, 2, where)
+            base = all_offs[-1]
 
             next_end = mm.find(b"\n", pos)
             next_line = (
@@ -1783,7 +1783,6 @@ def _parse_binary_polydata_body(
                 conn_v51, off_v51, pos = _parse_v51_cells_binary(
                     mm, mv, next_end + 1, n_cells, file_size, total=total_vals
                 )
-                base = all_offs[-1]
                 all_conn.append(conn_v51.astype(np.int32))
                 all_offs.extend((base + off_v51[1:]).tolist())
                 counts = np.diff(off_v51)
@@ -1803,7 +1802,7 @@ def _parse_binary_polydata_body(
                 raw_cells.tolist(), n_cells, kind, short="is too short to hold"
             )
             all_conn.append(np.array(conn_list, dtype=np.int32))
-            all_offs.extend(accumulate(widths, initial=all_offs[-1]))
+            all_offs.extend(base + run for run in accumulate(widths))
             all_types.extend(_polydata_cell_type(kind, cnt) for cnt in widths)
             n_elems += n_cells
 
