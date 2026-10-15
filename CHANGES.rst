@@ -4,12 +4,46 @@
 Changelog
 =========
 
-.. _changes_0.6.0:
+.. _changes_0.5.1:
 
-0.6.0 (upcoming)
-----------------
+0.5.1 (2026-10-15)
+------------------
 
-(No entries yet.)
+Bug fixes
+~~~~~~~~~
+
+- A binary legacy ``.vtk`` POLYDATA file whose cell sections carry no
+  ``OFFSETS`` block no longer reads with an empty first cell ahead of its
+  own, which shifted every cell one slot: a file of 13 streamlines read
+  as 14 cells. The ASCII and binary readers now agree on such a file.
+
+Packaging
+~~~~~~~~~
+
+- A release publishes to PyPI only from ``fury-gl/polyxios``. A tag
+  pushed to a fork still builds its wheels and its GitHub release, where
+  the PyPI job used to run and fail.
+
+
+GitHub stats for 2026/10/11 - 2026/10/15 (tag: v0.5.0)
+
+These lists are automatically generated and may be incomplete or contain duplicates.
+
+The following 1 authors contributed 7 commits.
+
+* Serge Koudoro
+
+
+We closed a total of 3 issues, 3 pull requests and 0 regular issues.
+
+Pull Requests (3):
+
+* :ghpull:`111`: BF: binary VTK POLYDATA reads no empty cell ahead of its cells
+* :ghpull:`110`: MNT: update pre-commit hooks
+* :ghpull:`108`: BF: spell XML-forbidden regex ranges as escapes in a raw string
+
+Issues (0):
+
 
 .. _changes_0.5.0:
 
